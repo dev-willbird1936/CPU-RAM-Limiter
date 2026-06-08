@@ -245,6 +245,27 @@ namespace RAMLIMITER
             }
         }
 
+        class CpuUsageSnapshot
+        {
+            public CpuUsageSnapshot(DateTime timestampUtc, double totalProcessorMs)
+            {
+                TimestampUtc = timestampUtc;
+                TotalProcessorMs = totalProcessorMs;
+            }
+
+            public DateTime TimestampUtc { get; private set; }
+            public double TotalProcessorMs { get; private set; }
+        }
+
+        class CpuThrottleStats
+        {
+            public int Applied { get; set; }
+            public int Failed { get; set; }
+            public double? UsagePercent { get; set; }
+        }
+
+        static readonly Dictionary<int, CpuUsageSnapshot> CpuUsageSamples = new Dictionary<int, CpuUsageSnapshot>();
+
         static RamUsage GetRamUsage()
         {
             try
@@ -603,36 +624,76 @@ namespace RAMLIMITER
         {
             while (true)
             {
-                int applied = 0;
-                int failed = 0;
                 var settings = LoadCpuModeSettings();
+                CpuThrottleStats stats = ApplyCpuModesForTargets(targets, settings);
 
-                foreach (var proc in Process.GetProcesses())
-                {
-                    using (proc)
-                    {
-                        ProcessTarget target = FindTargetForProcess(targets, proc);
-                        if (target == null)
-                            continue;
-
-                        try
-                        {
-                            ApplyCpuMode(proc, GetCpuMode(settings, target.DisplayName));
-                            applied++;
-                        }
-                        catch
-                        {
-                            failed++;
-                        }
-                    }
-                }
-
-                Console.ForegroundColor = applied > 0 ? ConsoleColor.Cyan : ConsoleColor.DarkGray;
-                Console.WriteLine("CPU: applied {0} process(es), failed {1}", applied, failed);
+                Console.ForegroundColor = stats.Applied > 0 ? ConsoleColor.Cyan : ConsoleColor.DarkGray;
+                Console.WriteLine("CPU: applied {0} process(es), failed {1}, usage {2}", stats.Applied, stats.Failed, FormatCpuUsage(stats.UsagePercent));
                 PrintCpuModeSummary(settings);
                 Console.ForegroundColor = ConsoleColor.White;
                 Thread.Sleep(interval);
             }
+        }
+
+        static CpuThrottleStats ApplyCpuModesForTargets(IEnumerable<ProcessTarget> targets, Dictionary<string, CpuThrottleMode> settings)
+        {
+            var stats = new CpuThrottleStats();
+            double totalCpuPercent = 0;
+            bool hasCpuSample = false;
+
+            foreach (var proc in Process.GetProcesses())
+            {
+                using (proc)
+                {
+                    ProcessTarget target = FindTargetForProcess(targets, proc);
+                    if (target == null)
+                        continue;
+
+                    try
+                    {
+                        double? processCpuPercent = GetProcessCpuUsagePercent(proc);
+                        if (processCpuPercent.HasValue)
+                        {
+                            totalCpuPercent += processCpuPercent.Value;
+                            hasCpuSample = true;
+                        }
+
+                        ApplyCpuMode(proc, GetCpuMode(settings, target.DisplayName));
+                        stats.Applied++;
+                    }
+                    catch
+                    {
+                        stats.Failed++;
+                    }
+                }
+            }
+
+            stats.UsagePercent = hasCpuSample ? (double?)totalCpuPercent : null;
+            return stats;
+        }
+
+        static double? GetProcessCpuUsagePercent(Process process)
+        {
+            DateTime now = DateTime.UtcNow;
+            double totalProcessorMs = process.TotalProcessorTime.TotalMilliseconds;
+
+            CpuUsageSnapshot previous;
+            bool hasPrevious = CpuUsageSamples.TryGetValue(process.Id, out previous);
+            CpuUsageSamples[process.Id] = new CpuUsageSnapshot(now, totalProcessorMs);
+            if (!hasPrevious)
+                return null;
+
+            double elapsedMs = (now - previous.TimestampUtc).TotalMilliseconds;
+            double cpuMs = totalProcessorMs - previous.TotalProcessorMs;
+            if (elapsedMs <= 0 || cpuMs < 0)
+                return null;
+
+            return Math.Max(0, (cpuMs / (elapsedMs * Environment.ProcessorCount)) * 100);
+        }
+
+        static string FormatCpuUsage(double? percent)
+        {
+            return percent.HasValue ? string.Format("{0:F2}%", percent.Value) : "warming up";
         }
 
         static void ApplyCpuMode(Process process, CpuThrottleMode mode)
@@ -915,6 +976,53 @@ namespace RAMLIMITER
             LimitRamForTargets(GetPrechosenTargets(), -1, -1, 5000, "PRECHOSEN");
         }
 
+        static void StartRamAndCpuLimiters()
+        {
+            if (prechosenLimiterStarted || cpuLimiterStarted)
+            {
+                PrintTimedMessage(ConsoleColor.Yellow, "RAM or CPU limiter is already running.");
+                return;
+            }
+
+            prechosenLimiterStarted = true;
+            cpuLimiterStarted = true;
+
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("Started RAM + CPU limiters.");
+            RamUsage ram = GetRamUsage();
+            if (ram != null)
+                Console.WriteLine("RAM before start: " + ram.ToDisplayString());
+            Console.WriteLine("RAM targets: " + string.Join(", ", GetPrechosenTargets().Select(t => t.DisplayName)));
+            PrintCpuModeSummary(LoadCpuModeSettings());
+            Console.WriteLine("Press Ctrl+C to stop.");
+            Console.ForegroundColor = ConsoleColor.White;
+
+            LimitRamAndCpuForTargets(GetPrechosenTargets(), PrechosenTargets, 5000);
+        }
+
+        static void LimitRamAndCpuForTargets(IEnumerable<ProcessTarget> ramTargets, IEnumerable<ProcessTarget> cpuTargets, int interval)
+        {
+            while (true)
+            {
+                int ramFailed;
+                int ramTrimmed = TrimTargets(ramTargets, new IntPtr(-1), new IntPtr(-1), out ramFailed);
+                RamUsage ram = GetRamUsage();
+
+                var cpuSettings = LoadCpuModeSettings();
+                CpuThrottleStats cpuStats = ApplyCpuModesForTargets(cpuTargets, cpuSettings);
+
+                Console.ForegroundColor = (ramTrimmed > 0 || cpuStats.Applied > 0) ? ConsoleColor.Cyan : ConsoleColor.DarkGray;
+                if (ram != null)
+                    Console.WriteLine("RAM: trimmed {0} process(es), failed {1}, usage {2}", ramTrimmed, ramFailed, ram.ToDisplayString());
+                else
+                    Console.WriteLine("RAM: trimmed {0} process(es), failed {1}", ramTrimmed, ramFailed);
+                Console.WriteLine("CPU: applied {0} process(es), failed {1}, usage {2}", cpuStats.Applied, cpuStats.Failed, FormatCpuUsage(cpuStats.UsagePercent));
+                Console.ForegroundColor = ConsoleColor.White;
+
+                Thread.Sleep(interval);
+            }
+        }
+
         [STAThread]
         static void Main(string[] args)
         {
@@ -959,6 +1067,7 @@ namespace RAMLIMITER
                 Console.WriteLine("Start Prechosen Apps with Windows: 8 [{0}]", IsPrechosenStartupEnabled() ? "On" : "Off");
                 Console.WriteLine("Start CPU Throttling: 9");
                 Console.WriteLine("Configure CPU Throttling: C");
+                Console.WriteLine("Start RAM + CPU Limiters: B");
                 Console.WriteLine("Exit: 0");
 
                 var key = Console.ReadKey(true).Key;
@@ -986,6 +1095,8 @@ namespace RAMLIMITER
                     StartCpuThrottleLimiter();
                 else if (key == ConsoleKey.C)
                     ConfigureCpuModes();
+                else if (key == ConsoleKey.B)
+                    StartRamAndCpuLimiters();
                 else if (key == ConsoleKey.D0 || key == ConsoleKey.NumPad0)
                     Environment.Exit(0);
                 else
